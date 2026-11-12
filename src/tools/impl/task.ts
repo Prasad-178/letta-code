@@ -972,9 +972,7 @@ export async function launchSubagent(
 }
 
 /** Agent's text adapter; App Server callers consume launchSubagent directly. */
-export async function task(
-  args: TaskArgs,
-): Promise<string | { content: string; status: "error" }> {
+export async function task(args: TaskArgs): Promise<string> {
   if (args.command === "refresh") {
     clearSubagentConfigCache();
     const { subagents, errors } = await discoverSubagents();
@@ -986,8 +984,7 @@ export async function task(
     return `Refreshed subagents list: found ${Object.keys(allConfigs).length} total (${subagents.length} custom)${errorSuffix}`;
   }
   const result = await launchSubagent(applySubagentPreset(args));
-  if (!result.success)
-    return { content: `Error: ${result.error}`, status: "error" };
+  if (!result.success) return `Error: ${result.error}`;
   const agentIdLine = result.agent_id ? `\nAgent ID: ${result.agent_id}` : "";
   const conversationIdLine = result.conversation_id
     ? `\nConversation ID: ${result.conversation_id}`
