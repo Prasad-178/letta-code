@@ -31,6 +31,11 @@ import {
   MONITOR_EVENT_BUFFER_CHARS,
 } from "./monitor-event-stream.js";
 import { startScriptMonitor } from "./monitor-script.js";
+import {
+  createMonitorState,
+  failMonitorState,
+  flushMonitorState,
+} from "./monitor-state";
 import { getMonitorMaxTimeoutMs } from "./monitor-timeout";
 import {
   assertBackgroundProcessCapacity,
@@ -87,6 +92,7 @@ interface MonitorArgs {
 type NormalizedMonitorArgs = MonitorArgs & {
   timeout_ms: number;
   persistent: boolean;
+  taskId?: string;
 };
 
 interface MonitorResult {
@@ -455,7 +461,7 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
   }
   noteExpectedWorktreeForLauncher(launcher, cwd);
   const sandboxed = applyShellSandbox(launcher, cwd, env);
-  const taskId = getNextMonitorId();
+  const taskId = args.taskId ?? getNextMonitorId();
   const outputFile = createBackgroundOutputFile(taskId);
   const output = new MonitorOutputWriter(outputFile);
   const scope = resolveNotificationScope(args.parentScope);
@@ -644,7 +650,7 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
 function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
   assertBackgroundProcessCapacity();
   const source = args.ws as MonitorWebSocketSource;
-  const taskId = getNextMonitorId();
+  const taskId = args.taskId ?? getNextMonitorId();
   const outputFile = createBackgroundOutputFile(taskId);
   const output = new MonitorOutputWriter(outputFile);
   const scope = resolveNotificationScope(args.parentScope);
@@ -837,6 +843,7 @@ async function startScriptSource(
 ): Promise<MonitorResult> {
   const { taskId, outputFile } = await startScriptMonitor(
     {
+      taskId: args.taskId,
       description: args.description,
       script: args.script as string,
       args: args.args,
@@ -871,12 +878,52 @@ export async function monitor(args: MonitorArgs): Promise<MonitorResult> {
   args.signal?.throwIfAborted();
   const normalized = normalizeMonitorArgs(args);
   installMonitorProcessExitCleanup();
-  const result =
-    normalized.script !== undefined
-      ? await startScriptSource(normalized)
-      : normalized.command !== undefined
-        ? startCommandMonitor(normalized)
-        : startWebSocketMonitor(normalized);
+  assertBackgroundProcessCapacity();
+  const scope = resolveNotificationScope(args.parentScope);
+  const secrets = captureSecretRedactions(scope?.agentId, args.secretEnv ?? {});
+  normalized.taskId = await createMonitorState(
+    {
+      description: scrubSecretsFromString(normalized.description, secrets),
+      kind:
+        normalized.script !== undefined
+          ? "script"
+          : normalized.command !== undefined
+            ? "command"
+            : "websocket",
+      command: scrubSecretsFromString(
+        normalized.command ??
+          normalized.script ??
+          webSocketDisplayUrl(normalized.ws?.url ?? ""),
+        secrets,
+      ),
+      status: "running",
+      persistent: normalized.persistent,
+    },
+    scope,
+    getRuntimeActingUserAttribution(),
+  );
+  let result: MonitorResult;
+  try {
+    args.signal?.throwIfAborted();
+    result =
+      normalized.script !== undefined
+        ? await startScriptSource(normalized)
+        : normalized.command !== undefined
+          ? startCommandMonitor(normalized)
+          : startWebSocketMonitor(normalized);
+    await flushMonitorState(result.taskId);
+  } catch (error) {
+    if (normalized.taskId) {
+      const process = backgroundProcesses.get(normalized.taskId);
+      if (process?.status === "running") {
+        process.status = "failed";
+        process.completionNotificationSuppressed = true;
+        process.process.kill("SIGTERM");
+      }
+      await failMonitorState(normalized.taskId);
+    }
+    throw error;
+  }
   if (normalized.backup_after_seconds === undefined) return result;
   const note = await armMonitorBackup({
     taskId: result.taskId,
