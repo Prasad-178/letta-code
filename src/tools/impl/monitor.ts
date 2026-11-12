@@ -31,13 +31,13 @@ import {
   MONITOR_EVENT_BUFFER_CHARS,
 } from "./monitor-event-stream.js";
 import { startScriptMonitor } from "./monitor-script.js";
+import { persistMonitorState, withMonitorState } from "./monitor-state";
 import { getMonitorMaxTimeoutMs } from "./monitor-timeout";
 import {
   assertBackgroundProcessCapacity,
   type BackgroundProcess,
   backgroundProcesses,
   createBackgroundOutputFile,
-  getNextMonitorId,
   notifyBackgroundProcessStateChanged,
   scheduleBackgroundProcessCleanup,
   scrubCompletedBackgroundOutput,
@@ -89,6 +89,7 @@ type NormalizedMonitorArgs = MonitorArgs & {
   timeout_ms: number;
   persistent: boolean;
 };
+type MonitorSourceArgs = NormalizedMonitorArgs & { taskId: string };
 
 interface MonitorResult {
   content: Array<{ type: "text"; text: string }>;
@@ -435,13 +436,14 @@ export function markMonitorFinished(
 ): void {
   processState.status = status;
   processState.exitCode = exitCode;
+  persistMonitorState(processState);
   void cancelMonitorBackup(taskId);
   scrubCompletedBackgroundOutput(processState);
   notifyBackgroundProcessStateChanged(processState.runtimeScope);
   scheduleBackgroundProcessCleanup(taskId);
 }
 
-function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
+function startCommandMonitor(args: MonitorSourceArgs): MonitorResult {
   assertBackgroundProcessCapacity();
   const command = args.command as string;
   const cwd = getCurrentWorkingDirectory();
@@ -457,7 +459,7 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
   }
   noteExpectedWorktreeForLauncher(launcher, cwd);
   const sandboxed = applyShellSandbox(launcher, cwd, env);
-  const taskId = getNextMonitorId();
+  const taskId = args.taskId;
   const outputFile = createBackgroundOutputFile(taskId);
   const output = new MonitorOutputWriter(outputFile);
   const scope = resolveNotificationScope(args.parentScope);
@@ -643,10 +645,10 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
   );
 }
 
-function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
+function startWebSocketMonitor(args: MonitorSourceArgs): MonitorResult {
   assertBackgroundProcessCapacity();
   const source = args.ws as MonitorWebSocketSource;
-  const taskId = getNextMonitorId();
+  const taskId = args.taskId;
   const outputFile = createBackgroundOutputFile(taskId);
   const output = new MonitorOutputWriter(outputFile);
   const scope = resolveNotificationScope(args.parentScope);
@@ -835,12 +837,13 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
 }
 
 async function startScriptSource(
-  args: NormalizedMonitorArgs,
+  args: MonitorSourceArgs,
 ): Promise<MonitorResult> {
   const { taskId, outputFile } = await startScriptMonitor(
     {
       description: args.description,
       script: args.script as string,
+      taskId: args.taskId,
       args: args.args,
       timeout_ms: args.timeout_ms,
       persistent: args.persistent,
@@ -873,12 +876,29 @@ export async function monitor(args: MonitorArgs): Promise<MonitorResult> {
   args.signal?.throwIfAborted();
   const normalized = normalizeMonitorArgs(args);
   installMonitorProcessExitCleanup();
-  const result =
-    normalized.script !== undefined
-      ? await startScriptSource(normalized)
-      : normalized.command !== undefined
-        ? startCommandMonitor(normalized)
-        : startWebSocketMonitor(normalized);
+  const result = await withMonitorState(
+    {
+      ...normalized,
+      kind:
+        normalized.script !== undefined
+          ? "script"
+          : normalized.command !== undefined
+            ? "command"
+            : "websocket",
+      command:
+        normalized.command ??
+        normalized.script ??
+        (normalized.ws ? webSocketDisplayUrl(normalized.ws.url) : ""),
+    },
+    (taskId) => {
+      const sourceArgs = { ...normalized, taskId };
+      return normalized.script !== undefined
+        ? startScriptSource(sourceArgs)
+        : normalized.command !== undefined
+          ? startCommandMonitor(sourceArgs)
+          : startWebSocketMonitor(sourceArgs);
+    },
+  );
   if (normalized.backup_after_seconds === undefined) return result;
   const note = await armMonitorBackup({
     taskId: result.taskId,
@@ -909,6 +929,15 @@ export function stopMonitorsForProcessExit(): void {
       // Process exit is already underway.
     }
   }
+}
+
+export async function shutdownMonitors(): Promise<void> {
+  stopMonitorsForProcessExit();
+  await Promise.all(
+    [...backgroundProcesses.values()]
+      .filter((process) => process.kind === "monitor")
+      .map(persistMonitorState),
+  );
 }
 
 let monitorProcessExitCleanupInstalled = false;

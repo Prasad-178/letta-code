@@ -277,6 +277,14 @@ export async function task_stop(
     };
   }
   const killed = killBackgroundProcess(task_id);
+  try {
+    if (killed) await process?.persistState?.();
+  } catch {
+    return {
+      killed,
+      output: "Monitor stopped, but its server state could not be saved",
+    };
+  }
   return {
     killed,
     ...(killed && process?.kind === "tool" ? { output: "Stopped" } : {}),
