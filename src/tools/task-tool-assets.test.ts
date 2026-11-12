@@ -3,7 +3,10 @@ import TaskDescriptionRaw from "./descriptions/Task.md";
 import { TASK_HARNESSES } from "./impl/task-agent-selection";
 import type { JsonSchema } from "./model-facing-tool";
 import TaskSchema from "./schemas/Task.json";
-import { stripComputerFromTaskSchema } from "./task-tool-assets";
+import {
+  resolveBackendSpecificToolAssets,
+  stripComputerFromTaskSchema,
+} from "./task-tool-assets";
 
 const taskSchema = TaskSchema as JsonSchema;
 const taskDescription = (TaskDescriptionRaw as string).trim();
@@ -121,4 +124,38 @@ describe("resolveBackendSpecificToolAssets Task dispatch", () => {
     expect(resolved.inputSchema.properties?.computer).toBeDefined();
     expect(resolved.description).toBe(taskDescription);
   });
+});
+
+test("Wake session warning appears only in the interactive TUI", async () => {
+  const { runWithRuntimeContext } = await import("@/runtime-context");
+  const previousDesktop = process.env.LETTA_DESKTOP_MODE;
+  try {
+    for (const sessionSource of [
+      "interactive-cli",
+      "listen",
+      "headless",
+      undefined,
+    ] as const) {
+      for (const desktop of ["1", undefined]) {
+        if (desktop) process.env.LETTA_DESKTOP_MODE = desktop;
+        else delete process.env.LETTA_DESKTOP_MODE;
+        const assets = await runWithRuntimeContext({ sessionSource }, () =>
+          resolveBackendSpecificToolAssets(
+            "Wake",
+            "Schedule a future turn.",
+            {},
+          ),
+        );
+        expect(
+          assets.description.includes(
+            "Wakes fire only while this session is running.",
+          ),
+        ).toBe(sessionSource === "interactive-cli" && !desktop);
+        expect(assets.description).not.toMatch(/local|cloud|runner/i);
+      }
+    }
+  } finally {
+    if (previousDesktop === undefined) delete process.env.LETTA_DESKTOP_MODE;
+    else process.env.LETTA_DESKTOP_MODE = previousDesktop;
+  }
 });

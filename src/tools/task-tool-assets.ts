@@ -1,4 +1,5 @@
 import { getBackend } from "@/backend";
+import { getRuntimeSessionSource } from "@/runtime-context";
 import type { JsonSchema } from "./model-facing-tool";
 
 /**
@@ -18,14 +19,24 @@ export function stripComputerFromTaskSchema(schema: JsonSchema): JsonSchema {
 
 /**
  * Adjust a bundled tool's model-facing assets for the active backend. Only
- * Task varies today: it advertises `computer` only when the backend can route
- * work to another environment.
+ * Task advertises `computer` only when the backend can route work to another
+ * environment; Wake adds a session-lifetime reminder only in the TUI.
  */
 export async function resolveBackendSpecificToolAssets(
   name: string,
   description: string,
   inputSchema: JsonSchema,
 ): Promise<{ description: string; inputSchema: JsonSchema }> {
+  if (
+    name === "Wake" &&
+    getRuntimeSessionSource() === "interactive-cli" &&
+    process.env.LETTA_DESKTOP_MODE !== "1"
+  ) {
+    return {
+      description: `${description.trimEnd()}\n\nWakes fire only while this session is running.`,
+      inputSchema,
+    };
+  }
   if (name !== "Task") {
     return { description, inputSchema };
   }
